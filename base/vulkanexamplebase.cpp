@@ -3283,6 +3283,28 @@ void VulkanExampleBase::handleMouseMove(int32_t x, int32_t y)
 	}
 	mouseState.position = glm::vec2((float)x, (float)y);
 }
+#if 0
+void VulkanExampleBase::handleMouseClick(int x, int y, int width, int height) {
+	// Convert to NDC
+	float ndcX = (2.0f * x) / width - 1.0f;
+	float ndcY = 1.0f - (2.0f * y) / height;
+
+	// Create ray direction in view space
+	glm::vec4 rayStart = glm::vec4(0, 0, 0, 1); // Camera position in view space
+	glm::vec4 rayEnd = glm::vec4(ndcX, ndcY, 1, 1); // Point on far plane
+
+	// Transform to world space
+	glm::mat4 invViewProj = glm::inverse(uniformData.projection * uniformData.view);
+	glm::vec4 worldStart = invViewProj * rayStart;
+	glm::vec4 worldEnd = invViewProj * rayEnd;
+
+	// Normalize to get ray direction
+	glm::vec3 rayOrigin = glm::vec3(worldStart / worldStart.w);
+	glm::vec3 rayDir = glm::normalize(glm::vec3(worldEnd / worldEnd.w) - rayOrigin);
+
+	// Use ray query in a compute shader or CPU-side ray-object intersection test
+}
+#endif
 
 void VulkanExampleBase::windowResized() {}
 
