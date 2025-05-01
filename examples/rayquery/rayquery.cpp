@@ -27,12 +27,13 @@ public:
 	} uniformData;
 	vks::Buffer uniformBuffer;
 
+	// Shared model that will be used by all objects
+	vkglTF::Model sphereModel;
+
 	// Structure to hold object data (for object picking)
 	struct PickableObject {
-		vkglTF::Model model;
 		glm::vec3 position;
 		glm::mat4 matrix;
-		VulkanRaytracingSample::AccelerationStructure blas;
 		uint32_t id;
 		bool selected = false;
 	};
@@ -47,8 +48,9 @@ public:
 	VkDescriptorSet descriptorSet{ VK_NULL_HANDLE };
 	VkDescriptorSetLayout descriptorSetLayout{ VK_NULL_HANDLE };
 
-	VulkanRaytracingSample::AccelerationStructure bottomLevelAS{};
-	VulkanRaytracingSample::AccelerationStructure topLevelAS{};
+	VulkanRaytracingSample::AccelerationStructure bottomLevelAS{};    // Main scene BLAS
+	VulkanRaytracingSample::AccelerationStructure objectBLAS{};       // Objects BLAS (shared by all sphere objects)
+	VulkanRaytracingSample::AccelerationStructure topLevelAS{};       // Top level acceleration structure
 
 	VkPhysicalDeviceRayQueryFeaturesKHR enabledRayQueryFeatures{};
 
@@ -76,15 +78,49 @@ public:
 			vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 			uniformBuffer.destroy();
 			deleteAccelerationStructure(bottomLevelAS);
+			deleteAccelerationStructure(objectBLAS);
 			deleteAccelerationStructure(topLevelAS);
-			
-			// Clean up BLASes for all objects
-			for (auto& obj : objects) {
-				if (obj.blas.handle != VK_NULL_HANDLE) {
-					deleteAccelerationStructure(obj.blas);
-				}
+		}
+	}
+
+	void loadAssets()
+	{
+		vkglTF::memoryPropertyFlags = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		const uint32_t glTFLoadingFlags = vkglTF::FileLoadingFlags::PreTransformVertices | vkglTF::FileLoadingFlags::PreMultiplyVertexColors | vkglTF::FileLoadingFlags::FlipY;
+		mainScene.loadFromFile(getAssetPath() + "models/vulkanscene_shadow.gltf", vulkanDevice, queue, glTFLoadingFlags);
+		
+		// Load a sphere model for our pickable objects
+		sphereModel.loadFromFile(getAssetPath() + "models/sphere.gltf", vulkanDevice, queue, glTFLoadingFlags);
+		
+		// Create a grid of objects for picking
+		setupScene();
+	}
+	
+	// Set up multiple objects for our scene
+	void setupScene()
+	{
+		// Create a 5x5 grid of spheres
+		float spacing = 3.0f;
+		uint32_t gridSize = 5;
+		uint32_t id = 0;
+		
+		for (int x = 0; x < gridSize; x++) {
+			for (int z = 0; z < gridSize; z++) {
+				PickableObject object;
+				object.position = glm::vec3(
+					(x - gridSize/2) * spacing,
+					0.5f,
+					(z - gridSize/2) * spacing
+				);
+				object.matrix = glm::translate(glm::mat4(1.0f), object.position);
+				object.id = id++;
+				object.selected = false;
+				
+				objects.push_back(object);
 			}
 		}
+		
+		std::cout << "Created " << objects.size() << " pickable objects" << std::endl;
 	}
 
 	/*
@@ -162,15 +198,12 @@ public:
 
 		deleteScratchBuffer(scratchBuffer);
 		
-		// Now create BLAS for each object in our scene
-		// We're using the same model, so we'll create one BLAS and share it
+		// Now create BLAS for the sphere model used by all objects
 		if (objects.size() > 0) {
-			vkglTF::Model& modelRef = objects[0].model;
-			
-			vertexBufferDeviceAddress.deviceAddress = getBufferDeviceAddress(modelRef.vertices.buffer);
-			indexBufferDeviceAddress.deviceAddress = getBufferDeviceAddress(modelRef.indices.buffer);
+			vertexBufferDeviceAddress.deviceAddress = getBufferDeviceAddress(sphereModel.vertices.buffer);
+			indexBufferDeviceAddress.deviceAddress = getBufferDeviceAddress(sphereModel.indices.buffer);
 
-			numTriangles = static_cast<uint32_t>(modelRef.indices.count) / 3;
+			numTriangles = static_cast<uint32_t>(sphereModel.indices.count) / 3;
 			
 			// Build
 			accelerationStructureGeometry = vks::initializers::accelerationStructureGeometryKHR();
@@ -179,7 +212,7 @@ public:
 			accelerationStructureGeometry.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
 			accelerationStructureGeometry.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
 			accelerationStructureGeometry.geometry.triangles.vertexData = vertexBufferDeviceAddress;
-			accelerationStructureGeometry.geometry.triangles.maxVertex = modelRef.vertices.count - 1;
+			accelerationStructureGeometry.geometry.triangles.maxVertex = sphereModel.vertices.count - 1;
 			accelerationStructureGeometry.geometry.triangles.vertexStride = sizeof(vkglTF::Vertex);
 			accelerationStructureGeometry.geometry.triangles.indexType = VK_INDEX_TYPE_UINT32;
 			accelerationStructureGeometry.geometry.triangles.indexData = indexBufferDeviceAddress;
@@ -202,8 +235,7 @@ public:
 				&accelerationStructureBuildSizesInfo);
 
 			// Create object BLAS
-			VulkanRaytracingSample::AccelerationStructure objectBlas{};
-			createAccelerationStructure(objectBlas, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, accelerationStructureBuildSizesInfo);
+			createAccelerationStructure(objectBLAS, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, accelerationStructureBuildSizesInfo);
 
 			// Reuse scratch buffer
 			scratchBuffer = createScratchBuffer(accelerationStructureBuildSizesInfo.buildScratchSize);
@@ -212,7 +244,7 @@ public:
 			accelerationBuildGeometryInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
 			accelerationBuildGeometryInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
 			accelerationBuildGeometryInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-			accelerationBuildGeometryInfo.dstAccelerationStructure = objectBlas.handle;
+			accelerationBuildGeometryInfo.dstAccelerationStructure = objectBLAS.handle;
 			accelerationBuildGeometryInfo.geometryCount = 1;
 			accelerationBuildGeometryInfo.pGeometries = &accelerationStructureGeometry;
 			accelerationBuildGeometryInfo.scratchData.deviceAddress = scratchBuffer.deviceAddress;
@@ -236,13 +268,8 @@ public:
 			// Get device address
 			VkAccelerationStructureDeviceAddressInfoKHR accelerationDeviceAddressInfo{};
 			accelerationDeviceAddressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
-			accelerationDeviceAddressInfo.accelerationStructure = objectBlas.handle;
-			objectBlas.deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(device, &accelerationDeviceAddressInfo);
-
-			// Assign the same BLAS to all objects
-			for (auto& obj : objects) {
-				obj.blas = objectBlas;
-			}
+			accelerationDeviceAddressInfo.accelerationStructure = objectBLAS.handle;
+			objectBLAS.deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(device, &accelerationDeviceAddressInfo);
 
 			deleteScratchBuffer(scratchBuffer);
 		}
@@ -286,7 +313,7 @@ public:
 			instance.mask = 0xFF;
 			instance.instanceShaderBindingTableRecordOffset = 0;
 			instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-			instance.accelerationStructureReference = objects[i].blas.deviceAddress;
+			instance.accelerationStructureReference = objectBLAS.deviceAddress; // Use the shared BLAS
 			
 			instances.push_back(instance);
 		}
@@ -351,7 +378,6 @@ public:
 		std::vector<VkAccelerationStructureBuildRangeInfoKHR*> accelerationBuildStructureRangeInfos = { &accelerationStructureBuildRangeInfo };
 
 		// Build the acceleration structure on the device via a one-time command buffer submission
-		// Some implementations may support acceleration structure building on the host (VkPhysicalDeviceAccelerationStructureFeaturesKHR->accelerationStructureHostCommands), but we prefer device builds
 		VkCommandBuffer commandBuffer = vulkanDevice->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);
 		vkCmdBuildAccelerationStructuresKHR(
 			commandBuffer,
@@ -375,14 +401,6 @@ public:
 		for (int32_t i = 0; i < drawCmdBuffers.size(); ++i)
 		{
 			VK_CHECK_RESULT(vkBeginCommandBuffer(drawCmdBuffers[i], &cmdBufInfo));
-
-			/*
-				Note: Explicit synchronization is not required between the render pass, as this is done implicit via sub pass dependencies
-			*/
-
-			/*
-				Second pass: Scene rendering with applied shadow map
-			*/
 
 			clearValues[0].color = { { 0.0f, 0.0f, 0.2f, 1.0f } };;
 			clearValues[1].depthStencil = { 1.0f, 0 };
@@ -418,7 +436,7 @@ public:
 				vkCmdPushConstants(drawCmdBuffers[i], pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &obj.matrix);
 				
 				// Draw the object
-				obj.model.draw(drawCmdBuffers[i]);
+				sphereModel.draw(drawCmdBuffers[i]);
 			}
 
 			VulkanExampleBase::drawUI(drawCmdBuffers[i]);
@@ -427,48 +445,6 @@ public:
 
 			VK_CHECK_RESULT(vkEndCommandBuffer(drawCmdBuffers[i]));
 		}
-	}
-
-	void loadAssets()
-	{
-		vkglTF::memoryPropertyFlags = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-		const uint32_t glTFLoadingFlags = vkglTF::FileLoadingFlags::PreTransformVertices | vkglTF::FileLoadingFlags::PreMultiplyVertexColors | vkglTF::FileLoadingFlags::FlipY;
-		mainScene.loadFromFile(getAssetPath() + "models/vulkanscene_shadow.gltf", vulkanDevice, queue, glTFLoadingFlags);
-		
-		// Load a sphere model for our pickable objects
-		vkglTF::Model sphereModel;
-		sphereModel.loadFromFile(getAssetPath() + "models/sphere.gltf", vulkanDevice, queue, glTFLoadingFlags);
-		
-		// Create a grid of objects for picking
-		setupScene(sphereModel);
-	}
-	
-	// Set up multiple objects for our scene
-	void setupScene(vkglTF::Model& model)
-	{
-		// Create a 5x5 grid of spheres
-		float spacing = 3.0f;
-		uint32_t gridSize = 5;
-		uint32_t id = 0;
-		
-		for (int x = 0; x < gridSize; x++) {
-			for (int z = 0; z < gridSize; z++) {
-				PickableObject object;
-				object.position = glm::vec3(
-					(x - gridSize/2) * spacing,
-					0.5f,
-					(z - gridSize/2) * spacing
-				);
-				object.matrix = glm::translate(glm::mat4(1.0f), object.position);
-				object.id = id++;
-				object.model = model;
-				object.selected = false;
-				
-				objects.push_back(object);
-			}
-		}
-		
-		std::cout << "Created " << objects.size() << " pickable objects" << std::endl;
 	}
 
 	void setupDescriptors()

@@ -117,6 +117,7 @@ set(EXAMPLES
 	gltfloading
 	gltfscenerendering
 	gltfskinning
+	manipulator_demo
 	graphicspipelinelibrary
 	hdr
 	hostimagecopy
