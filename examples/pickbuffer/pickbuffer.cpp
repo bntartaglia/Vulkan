@@ -275,8 +275,10 @@ public:
         imageInfo.arrayLayers = 1;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        // Image needs to be sampled and used as transfer source for reading
+        // Image needs to be both a color attachment (for rendering) and transfer source (for reading)
         imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        // Set initial layout to undefined
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VK_CHECK_RESULT(vkCreateImage(device, &imageInfo, nullptr, &pickBuffer.image));
 
         // Allocate memory for the image
@@ -567,9 +569,12 @@ public:
     }
 
     void buildPickCommandBuffer() {
+        // Begin the command buffer (no need to reset, we'll overwrite it)
         VkCommandBufferBeginInfo cmdBufInfo = vks::initializers::commandBufferBeginInfo();
+        cmdBufInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK_RESULT(vkBeginCommandBuffer(pickCmdBuffer, &cmdBufInfo));
 
+        // Clear the pick buffer to pure black - this represents "no object"
         VkClearValue clearValues[2];
         clearValues[0].color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
         clearValues[1].depthStencil = { 1.0f, 0 };
@@ -618,8 +623,9 @@ public:
     void buildCommandBuffers() {
         VkCommandBufferBeginInfo cmdBufInfo = vks::initializers::commandBufferBeginInfo();
 
+        // These clear values are for the main scene
         VkClearValue clearValues[2];
-        clearValues[0].color = { { 0.2f, 0.2f, 0.2f, 1.0f } };
+        clearValues[0].color = { { 0.2f, 0.2f, 0.2f, 1.0f } };  // Dark gray background
         clearValues[1].depthStencil = { 1.0f, 0 };
 
         VkRenderPassBeginInfo renderPassBeginInfo = vks::initializers::renderPassBeginInfo();
@@ -681,73 +687,9 @@ public:
 
             // End main render pass
             vkCmdEndRenderPass(drawCmdBuffers[i]);
-
-            // Only do object ID rendering in the first command buffer (enough for one frame)
-            if (i == 0) {
-                // Clear values for the pick buffer attachments
-                VkClearValue pickClearValues[2];
-                pickClearValues[0].color = { { 0.0f, 0.0f, 0.0f, 0.0f } };     // Clear pick image to black (no ID = 0)
-                pickClearValues[1].depthStencil = { 1.0f, 0 };                 // Clear depth buffer
-
-                // Set up the render pass begin info for the pick buffer
-                renderPassBeginInfo.renderPass = pickBuffer.renderPass;
-                renderPassBeginInfo.framebuffer = pickBuffer.frameBuffer;
-                renderPassBeginInfo.clearValueCount = 2;
-                renderPassBeginInfo.pClearValues = pickClearValues;
-
-                // Begin the pick buffer render pass
-                vkCmdBeginRenderPass(drawCmdBuffers[i], &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
-
-                // Set the viewport and scissor for the full screen
-                vkCmdSetViewport(drawCmdBuffers[i], 0, 1, &viewport);
-                vkCmdSetScissor(drawCmdBuffers[i], 0, 1, &scissor);
-
-                // Bind the pipeline that writes object ID colors to the color buffer
-                vkCmdBindPipeline(drawCmdBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pickBuffer.pipeline);
-
-                // Bind descriptor set (for view/projection matrices)
-                vkCmdBindDescriptorSets(drawCmdBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pickBuffer.pipelineLayout, 0, 1, &pickBuffer.descriptorSet, 0, nullptr);
-
-                // Bind geometry buffers (same as main render pass)
-                VkDeviceSize offsets[1] = { 0 };
-                vkCmdBindVertexBuffers(drawCmdBuffers[i], 0, 1, &model.vertices.buffer, offsets);
-                vkCmdBindIndexBuffer(drawCmdBuffers[i], model.indices.buffer, 0, VK_INDEX_TYPE_UINT32);
-
-                // Draw each object with a unique encoded ID color
-                for (const auto& object : objects) {
-                    // Push the object's transform matrix to the vertex shader
-                    vkCmdPushConstants(
-                        drawCmdBuffers[i],
-                        pickBuffer.pipelineLayout,
-                        VK_SHADER_STAGE_VERTEX_BIT,
-                        0,
-                        sizeof(glm::mat4),
-                        &object.transform);
-
-                    // Encode the object ID into a color and push it to the fragment shader
-                    struct {
-                        glm::vec3 idColor;  // Unique RGB color encoding object ID
-                        float padding;      // To align with std140 rules
-                    } pickPushConstants;
-
-                    pickPushConstants.idColor = object.getIdColor();
-                    pickPushConstants.padding = 0.0f;
-
-                    vkCmdPushConstants(
-                        drawCmdBuffers[i],
-                        pickBuffer.pipelineLayout,
-                        VK_SHADER_STAGE_FRAGMENT_BIT,
-                        sizeof(glm::mat4),  // Offset after model matrix
-                        sizeof(pickPushConstants),
-                        &pickPushConstants);
-
-                    // Draw the indexed geometry
-                    vkCmdDrawIndexed(drawCmdBuffers[i], model.indexCount, 1, 0, 0, 0);
-                }
-
-                // End the pick buffer render pass
-                vkCmdEndRenderPass(drawCmdBuffers[i]);
-            }
+            
+            // We don't render the pick buffer as part of the main command buffer anymore
+            // This is now done on-demand in the pickObject function
 
             VK_CHECK_RESULT(vkEndCommandBuffer(drawCmdBuffers[i]));
         }
@@ -757,14 +699,24 @@ public:
     void pickObject(float mouseX, float mouseY) {
         // Make sure the initial command buffer has been built
         if (prepared) {
+            std::cout << "Processing pick at: " << mouseX << ", " << mouseY << std::endl;
+            
+            // Make sure we have up-to-date uniform buffers (camera matrices)
+            // This is critical - we need to make sure the scene is rendered with current camera
+            uniformData.projection = camera.matrices.perspective;
+            uniformData.view = camera.matrices.view;
+            memcpy(uniformBuffers.scene.mapped, &uniformData, sizeof(UniformData));
+            
             // 1. Render the objects with ID colors to the pick buffer
             // Create and begin command buffer for the pick rendering
             buildPickCommandBuffer();
 
-            // Submit the pick rendering command buffer
+            // Submit the pick rendering command buffer - wait for it to complete
             VkSubmitInfo submitInfo = vks::initializers::submitInfo();
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &pickCmdBuffer;
+            
+            // Force the queue to render the pick buffer
             VK_CHECK_RESULT(vkResetFences(device, 1, &pickFence));
             VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &submitInfo, pickFence));
             VK_CHECK_RESULT(vkWaitForFences(device, 1, &pickFence, VK_TRUE, UINT64_MAX));
@@ -792,8 +744,11 @@ public:
             // Calculate the pixel coordinates to read from the pick buffer
             VkOffset3D offset;
             offset.x = static_cast<int32_t>(mouseX);
+            // Try without Y inversion first since we don't know the actual rendering system
             offset.y = static_cast<int32_t>(mouseY);
             offset.z = 0;
+
+            std::cout << "Reading pixel at: " << offset.x << ", " << offset.y << std::endl;
 
             VkExtent3D extent;
             extent.width = 1;
@@ -825,6 +780,7 @@ public:
                 1,
                 &region);
 
+            // Submit and wait for completion
             vulkanDevice->flushCommandBuffer(copyCmdBuffer, queue);
 
             // Read the pixel data
@@ -954,10 +910,20 @@ public:
         mousePos.x = x;
         mousePos.y = y;
         
+        // Get the current state of the left mouse button
+        bool leftButtonDown = mouseState.buttons.left;
+        
+        // Only for debugging - remove in production
+        // std::cout << "Mouse at: " << x << ", " << y << " Left: " << leftButtonDown << " wasDown: " << wasMouseDown << std::endl;
+        
         // Check if a click event has happened using mouseState from the base class
-        if (mouseState.buttons.left) {
+        if (leftButtonDown) {
             if (!wasMouseDown) {
+                // Ensure we have latest camera matrices before picking
+                updateUniformBuffers();
+                
                 // Mouse button just pressed - pick object
+                std::cout << "Picking at: " << x << ", " << y << std::endl;
                 pickObject(static_cast<float>(x), static_cast<float>(y));
                 handled = true;
                 wasMouseDown = true;
