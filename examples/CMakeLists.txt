@@ -118,6 +118,7 @@ set(EXAMPLES
 	gltfscenerendering
 	gltfskinning
 	manipulator_demo
+	pickbuffer
 	graphicspipelinelibrary
 	hdr
 	hostimagecopy

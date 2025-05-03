@@ -11,7 +11,7 @@ parser = argparse.ArgumentParser(description='Compile all GLSL shaders')
 parser.add_argument('--glslang', type=str, help='path to glslangvalidator executable')
 parser.add_argument('--g', action='store_true', help='compile with debug symbols')
 args = parser.parse_args()
-
+print("glslangValidator = " . $args.glslang)
 def findGlslang():
     def isExe(path):
         return os.path.isfile(path) and os.access(path, os.X_OK)

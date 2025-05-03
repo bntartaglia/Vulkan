@@ -10,9 +10,28 @@
 * This code is licensed under the MIT license (MIT) (http://opensource.org/licenses/MIT)
 */
 
-// Do not include the TinyGLTF library at all
-// We don't actually use it in this example
-// #include "tiny_gltf.h"
+/*
++---------------------+
+|   Swapchain Images  |
+|  (Presentation)     |
++---------------------+
+          ^
+          |
+          | (Rendered by)
+          |
++---------------------+
+|   Command Buffers   |
+|  (Per Swapchain)    |
++---------------------+
+          ^
+          |
+          | (Includes)
+          |
++---------------------+       +---------------------+
+|   Main Render Pass  |       |  Pick Buffer Pass   |
+|  (Scene Rendering)  |       | (Object Selection)  |
++---------------------+       +---------------------+
+*/
 
 #include <random>
 #include "vulkanexamplebase.h"
@@ -71,6 +90,10 @@ public:
     // Scene objects
     std::vector<Object> objects;
     int selectedObjectIndex = -1;
+
+    // Separate command buffer for pick pass � do not share swapchain draw command buffers
+    VkCommandBuffer pickCmdBuffer;
+    VkFence pickFence;
 
     // Main rendering pass
     struct {
@@ -143,6 +166,9 @@ public:
 
         // Uniform buffers
         uniformBuffers.scene.destroy();
+
+        // destroy pick buffer fence
+        vkDestroyFence(device, pickFence, nullptr);
     }
 
     // Create a sphere model using UV sphere construction
@@ -411,29 +437,47 @@ public:
         // Update with only 3 parameters if your framework uses the older API
         vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
     }
-
     void preparePipelines() {
+        // === Input Assembly ===
+        // Specifies how primitives are assembled from vertices.
+        // Triangle list is the most common primitive topology.
         VkPipelineInputAssemblyStateCreateInfo inputAssemblyState =
-            vks::initializers::pipelineInputAssemblyStateCreateInfo(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_FALSE);
+            vks::initializers::pipelineInputAssemblyStateCreateInfo(
+                VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_FALSE);
 
+        // === Rasterization State ===
+        // Describes how geometry is rasterized (e.g., filled or wireframe).
+        // No default exists; must be explicitly defined.
         VkPipelineRasterizationStateCreateInfo rasterizationState =
-            vks::initializers::pipelineRasterizationStateCreateInfo(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0);
+            vks::initializers::pipelineRasterizationStateCreateInfo(
+                VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0);
 
+        // === Color Blend State ===
+        // Controls how fragment output is blended with framebuffer contents.
+        // Even if you don�t use blending, this state must be set.
         VkPipelineColorBlendAttachmentState blendAttachmentState =
             vks::initializers::pipelineColorBlendAttachmentState(0xf, VK_FALSE);
-
         VkPipelineColorBlendStateCreateInfo colorBlendState =
             vks::initializers::pipelineColorBlendStateCreateInfo(1, &blendAttachmentState);
 
+        // === Depth and Stencil State ===
+        // Enables depth testing; stencil test is not used in this example.
         VkPipelineDepthStencilStateCreateInfo depthStencilState =
             vks::initializers::pipelineDepthStencilStateCreateInfo(VK_TRUE, VK_TRUE, VK_COMPARE_OP_LESS_OR_EQUAL);
 
+        // === Viewport State ===
+        // Describes viewport and scissor count/types.
+        // Even if you use dynamic viewport/scissor, this struct is required.
         VkPipelineViewportStateCreateInfo viewportState =
             vks::initializers::pipelineViewportStateCreateInfo(1, 1, 0);
 
+        // === Multisampling State ===
+        // Used for anti-aliasing. Even if not enabled, must be defined.
         VkPipelineMultisampleStateCreateInfo multisampleState =
             vks::initializers::pipelineMultisampleStateCreateInfo(VK_SAMPLE_COUNT_1_BIT, 0);
 
+        // === Dynamic State ===
+        // Allows you to change viewport/scissor without recreating the pipeline.
         std::vector<VkDynamicState> dynamicStateEnables = {
             VK_DYNAMIC_STATE_VIEWPORT,
             VK_DYNAMIC_STATE_SCISSOR
@@ -441,7 +485,8 @@ public:
         VkPipelineDynamicStateCreateInfo dynamicState =
             vks::initializers::pipelineDynamicStateCreateInfo(dynamicStateEnables);
 
-        // Vertex input state
+        // === Vertex Input State ===
+        // Describes how vertex data is laid out in memory and fed to the vertex shader.
         VkVertexInputBindingDescription vertexInputBinding =
             vks::initializers::vertexInputBindingDescription(0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX);
 
@@ -458,8 +503,12 @@ public:
         vertexInputState.vertexAttributeDescriptionCount = static_cast<uint32_t>(vertexInputAttributes.size());
         vertexInputState.pVertexAttributeDescriptions = vertexInputAttributes.data();
 
-        // Graphics pipeline
+        // === Shader Stages ===
+        // Each graphics pipeline requires at least a vertex and fragment shader.
         std::array<VkPipelineShaderStageCreateInfo, 2> shaderStages;
+
+        // === Pipeline Create Info ===
+        // Master struct that ties everything together and creates the pipeline.
         VkGraphicsPipelineCreateInfo pipelineCreateInfo =
             vks::initializers::pipelineCreateInfo(graphics.pipelineLayout, renderPass, 0);
 
@@ -474,19 +523,19 @@ public:
         pipelineCreateInfo.stageCount = static_cast<uint32_t>(shaderStages.size());
         pipelineCreateInfo.pStages = shaderStages.data();
 
-        // For both pipelines, we use the same vertex shader and different fragment shaders
+        // === Load Vertex Shader (shared across pipelines) ===
         shaderStages[0] = loadShader(getShadersPath() + "pickbuffer/sphere.vert.spv", VK_SHADER_STAGE_VERTEX_BIT);
-        
-        // Graphics pipeline with color
+
+        // === Load Fragment Shader for visible rendering ===
         shaderStages[1] = loadShader(getShadersPath() + "pickbuffer/sphere.frag.spv", VK_SHADER_STAGE_FRAGMENT_BIT);
         VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCreateInfo, nullptr, &graphics.pipeline));
 
-        // Pick buffer pipeline that renders object IDs as colors
+        // === Load Fragment Shader for object picking (ID rendering) ===
         pipelineCreateInfo.renderPass = pickBuffer.renderPass;
         shaderStages[1] = loadShader(getShadersPath() + "pickbuffer/picking.frag.spv", VK_SHADER_STAGE_FRAGMENT_BIT);
         VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCreateInfo, nullptr, &pickBuffer.pipeline));
 
-        // Wire frame rendering if supported
+        // === Optional: Wireframe pipeline (if supported by hardware) ===
         if (deviceFeatures.fillModeNonSolid) {
             rasterizationState.polygonMode = VK_POLYGON_MODE_LINE;
             rasterizationState.lineWidth = 1.0f;
@@ -495,7 +544,7 @@ public:
             VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCreateInfo, nullptr, &graphics.wireframe));
         }
     }
-
+    
     // Prepare and initialize uniform buffer containing shader uniforms
     void prepareUniformBuffers() {
         // Vertex shader uniform buffer block
@@ -515,6 +564,54 @@ public:
         uniformData.projection = camera.matrices.perspective;
         uniformData.view = camera.matrices.view;
         memcpy(uniformBuffers.scene.mapped, &uniformData, sizeof(UniformData));
+    }
+
+    void buildPickCommandBuffer() {
+        VkCommandBufferBeginInfo cmdBufInfo = vks::initializers::commandBufferBeginInfo();
+        VK_CHECK_RESULT(vkBeginCommandBuffer(pickCmdBuffer, &cmdBufInfo));
+
+        VkClearValue clearValues[2];
+        clearValues[0].color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+        clearValues[1].depthStencil = { 1.0f, 0 };
+
+        VkRenderPassBeginInfo renderPassBeginInfo = vks::initializers::renderPassBeginInfo();
+        renderPassBeginInfo.renderPass = pickBuffer.renderPass;
+        renderPassBeginInfo.framebuffer = pickBuffer.frameBuffer;
+        renderPassBeginInfo.renderArea.offset = { 0, 0 };
+        renderPassBeginInfo.renderArea.extent = { pickBuffer.width, pickBuffer.height };
+        renderPassBeginInfo.clearValueCount = 2;
+        renderPassBeginInfo.pClearValues = clearValues;
+
+        vkCmdBeginRenderPass(pickCmdBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+        VkViewport viewport = vks::initializers::viewport((float)width, (float)height, 0.0f, 1.0f);
+        VkRect2D scissor = vks::initializers::rect2D(width, height, 0, 0);
+        vkCmdSetViewport(pickCmdBuffer, 0, 1, &viewport);
+        vkCmdSetScissor(pickCmdBuffer, 0, 1, &scissor);
+
+        vkCmdBindDescriptorSets(pickCmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pickBuffer.pipelineLayout, 0, 1, &pickBuffer.descriptorSet, 0, nullptr);
+        vkCmdBindPipeline(pickCmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pickBuffer.pipeline);
+
+        VkDeviceSize offsets[] = { 0 };
+        vkCmdBindVertexBuffers(pickCmdBuffer, 0, 1, &model.vertices.buffer, offsets);
+        vkCmdBindIndexBuffer(pickCmdBuffer, model.indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+        for (const auto& object : objects) {
+            vkCmdPushConstants(pickCmdBuffer, pickBuffer.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &object.transform);
+
+            struct {
+                glm::vec3 idColor;
+                float pad;
+            } push{};
+            push.idColor = object.getIdColor();
+
+            vkCmdPushConstants(pickCmdBuffer, pickBuffer.pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(glm::mat4), sizeof(push), &push);
+
+            vkCmdDrawIndexed(pickCmdBuffer, model.indexCount, 1, 0, 0, 0);
+        }
+
+        vkCmdEndRenderPass(pickCmdBuffer);
+        VK_CHECK_RESULT(vkEndCommandBuffer(pickCmdBuffer));
     }
 
     // Build command buffers for main rendering and pick buffer rendering
@@ -585,53 +682,70 @@ public:
             // End main render pass
             vkCmdEndRenderPass(drawCmdBuffers[i]);
 
-            // Second render pass: Object picking
-            if (i == 0) { // Only need to do this for one command buffer
-                // Clear values for pick buffer
+            // Only do object ID rendering in the first command buffer (enough for one frame)
+            if (i == 0) {
+                // Clear values for the pick buffer attachments
                 VkClearValue pickClearValues[2];
-                pickClearValues[0].color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-                pickClearValues[1].depthStencil = { 1.0f, 0 };
+                pickClearValues[0].color = { { 0.0f, 0.0f, 0.0f, 0.0f } };     // Clear pick image to black (no ID = 0)
+                pickClearValues[1].depthStencil = { 1.0f, 0 };                 // Clear depth buffer
 
+                // Set up the render pass begin info for the pick buffer
                 renderPassBeginInfo.renderPass = pickBuffer.renderPass;
                 renderPassBeginInfo.framebuffer = pickBuffer.frameBuffer;
                 renderPassBeginInfo.clearValueCount = 2;
                 renderPassBeginInfo.pClearValues = pickClearValues;
 
+                // Begin the pick buffer render pass
                 vkCmdBeginRenderPass(drawCmdBuffers[i], &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-                // Set viewport and scissor
+                // Set the viewport and scissor for the full screen
                 vkCmdSetViewport(drawCmdBuffers[i], 0, 1, &viewport);
                 vkCmdSetScissor(drawCmdBuffers[i], 0, 1, &scissor);
 
-                // Bind the pick buffer pipeline and descriptor set
-                vkCmdBindDescriptorSets(drawCmdBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pickBuffer.pipelineLayout, 0, 1, &pickBuffer.descriptorSet, 0, nullptr);
+                // Bind the pipeline that writes object ID colors to the color buffer
                 vkCmdBindPipeline(drawCmdBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pickBuffer.pipeline);
 
-                // Bind the same vertex and index buffers
+                // Bind descriptor set (for view/projection matrices)
+                vkCmdBindDescriptorSets(drawCmdBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pickBuffer.pipelineLayout, 0, 1, &pickBuffer.descriptorSet, 0, nullptr);
+
+                // Bind geometry buffers (same as main render pass)
+                VkDeviceSize offsets[1] = { 0 };
                 vkCmdBindVertexBuffers(drawCmdBuffers[i], 0, 1, &model.vertices.buffer, offsets);
                 vkCmdBindIndexBuffer(drawCmdBuffers[i], model.indices.buffer, 0, VK_INDEX_TYPE_UINT32);
 
-                // Draw all objects with unique ID colors
+                // Draw each object with a unique encoded ID color
                 for (const auto& object : objects) {
-                    // Push constants for model matrix
-                    vkCmdPushConstants(drawCmdBuffers[i], pickBuffer.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &object.transform);
+                    // Push the object's transform matrix to the vertex shader
+                    vkCmdPushConstants(
+                        drawCmdBuffers[i],
+                        pickBuffer.pipelineLayout,
+                        VK_SHADER_STAGE_VERTEX_BIT,
+                        0,
+                        sizeof(glm::mat4),
+                        &object.transform);
 
-                    // Push constants for object ID color
+                    // Encode the object ID into a color and push it to the fragment shader
                     struct {
-                        glm::vec3 idColor;
-                        float padding;
+                        glm::vec3 idColor;  // Unique RGB color encoding object ID
+                        float padding;      // To align with std140 rules
                     } pickPushConstants;
-                    
+
                     pickPushConstants.idColor = object.getIdColor();
                     pickPushConstants.padding = 0.0f;
-                    
-                    vkCmdPushConstants(drawCmdBuffers[i], pickBuffer.pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 
-                                      sizeof(glm::mat4), sizeof(pickPushConstants), &pickPushConstants);
 
-                    // Draw the object
+                    vkCmdPushConstants(
+                        drawCmdBuffers[i],
+                        pickBuffer.pipelineLayout,
+                        VK_SHADER_STAGE_FRAGMENT_BIT,
+                        sizeof(glm::mat4),  // Offset after model matrix
+                        sizeof(pickPushConstants),
+                        &pickPushConstants);
+
+                    // Draw the indexed geometry
                     vkCmdDrawIndexed(drawCmdBuffers[i], model.indexCount, 1, 0, 0, 0);
                 }
 
+                // End the pick buffer render pass
                 vkCmdEndRenderPass(drawCmdBuffers[i]);
             }
 
@@ -643,14 +757,20 @@ public:
     void pickObject(float mouseX, float mouseY) {
         // Make sure the initial command buffer has been built
         if (prepared) {
-            // Get matrices for conversion
-            glm::mat4 viewMatrix = camera.matrices.view;
-            glm::mat4 projMatrix = camera.matrices.perspective;
+            // 1. Render the objects with ID colors to the pick buffer
+            // Create and begin command buffer for the pick rendering
+            buildPickCommandBuffer();
 
-            // Create a single-use command buffer for copy operations
-            VkCommandBuffer cmdBuffer = vulkanDevice->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);
-
-            // Create a host-visible buffer to store the picked pixel
+            // Submit the pick rendering command buffer
+            VkSubmitInfo submitInfo = vks::initializers::submitInfo();
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &pickCmdBuffer;
+            VK_CHECK_RESULT(vkResetFences(device, 1, &pickFence));
+            VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &submitInfo, pickFence));
+            VK_CHECK_RESULT(vkWaitForFences(device, 1, &pickFence, VK_TRUE, UINT64_MAX));
+            
+            // 2. Read the pixel color at mouse coordinates
+            // Create a staging buffer for the pixel data
             VkBuffer stagingBuffer;
             VkDeviceMemory stagingMemory;
             VkBufferCreateInfo bufInfo = vks::initializers::bufferCreateInfo();
@@ -665,6 +785,9 @@ public:
             memAlloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
             VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &stagingMemory));
             VK_CHECK_RESULT(vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0));
+
+            // Create a separate command buffer for the copy operation
+            VkCommandBuffer copyCmdBuffer = vulkanDevice->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);
 
             // Calculate the pixel coordinates to read from the pick buffer
             VkOffset3D offset;
@@ -693,29 +816,36 @@ public:
             region.imageOffset = offset;
             region.imageExtent = extent;
 
+            // Record and submit the copy command
             vkCmdCopyImageToBuffer(
-                cmdBuffer,
+                copyCmdBuffer,
                 pickBuffer.image,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,  // Must match finalLayout in renderpass
                 stagingBuffer,
                 1,
                 &region);
 
-            // Submit command buffer
-            vulkanDevice->flushCommandBuffer(cmdBuffer, queue, true);
+            vulkanDevice->flushCommandBuffer(copyCmdBuffer, queue);
 
-            // Get the pixel data
-            uint8_t pixelData[4];
+            // Read the pixel data
+            uint8_t pixelData[4] = {0, 0, 0, 0}; // Initialize with zeros
             void* data;
             VK_CHECK_RESULT(vkMapMemory(device, stagingMemory, 0, 4, 0, &data));
             memcpy(pixelData, data, 4);
             vkUnmapMemory(device, stagingMemory);
 
+            // Debug output
+            std::cout << "Picked pixel data: [" 
+                      << (int)pixelData[0] << ", " 
+                      << (int)pixelData[1] << ", " 
+                      << (int)pixelData[2] << ", " 
+                      << (int)pixelData[3] << "]" << std::endl;
+
             // Clean up resources
             vkDestroyBuffer(device, stagingBuffer, nullptr);
             vkFreeMemory(device, stagingMemory, nullptr);
 
-            // Convert the pixel data to an object ID
+            // 3. Convert the pixel data to an object ID
             uint32_t objectId = pixelData[0] | (pixelData[1] << 8) | (pixelData[2] << 16);
 
             // Reset all selections
@@ -736,10 +866,10 @@ public:
             } else {
                 // No object selected
                 selectedObjectIndex = -1;
-                std::cout << "No object selected" << std::endl;
+                std::cout << "No object selected (ID: " << objectId << ")" << std::endl;
             }
 
-            // Rebuild command buffers to update the selection visuals
+            // 4. Rebuild command buffers to update the selection visuals
             buildCommandBuffers();
         }
     }
@@ -761,6 +891,16 @@ public:
         setupDescriptorSets();
         preparePipelines();
         buildCommandBuffers();
+
+        // Pick Buffer preparation.... (might want to factor into its own function)
+        // Allocate pick command buffer
+        VkCommandBufferAllocateInfo allocInfo = vks::initializers::commandBufferAllocateInfo(
+            vulkanDevice->commandPool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1);
+        VK_CHECK_RESULT(vkAllocateCommandBuffers(device, &allocInfo, &pickCmdBuffer));
+
+        // Create fence for synchronization
+        VkFenceCreateInfo fenceInfo = vks::initializers::fenceCreateInfo(VK_FLAGS_NONE);
+        VK_CHECK_RESULT(vkCreateFence(device, &fenceInfo, nullptr, &pickFence));
         
         prepared = true;
     }
