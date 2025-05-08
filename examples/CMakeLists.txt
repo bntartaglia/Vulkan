@@ -112,6 +112,7 @@ set(EXAMPLES
 	dynamicrenderingmultisampling
 	dynamicstate
 	dynamicuniformbuffer	
+	dxvkinterop
 	gears
 	geometryshader
 	gltfloading
@@ -119,6 +120,8 @@ set(EXAMPLES
 	gltfskinning
 	manipulator_demo
 	pickbuffer
+	marqueepick 
+	deeppicking
 	graphicspipelinelibrary
 	hdr
 	hostimagecopy
